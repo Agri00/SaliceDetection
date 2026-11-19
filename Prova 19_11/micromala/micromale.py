@@ -35,7 +35,10 @@ REMOVE_CLUTTER = True
 NORMALIZATION = "minmax"
 
 # Soglia di binarizzazione
-THRESHOLD = 0.75
+THRESHOLD = 0.60
+
+#Clutter alpha
+CLUTTERALPHA = 1
 
 # Parametri STFT
 STFT_WINDOW = 32
@@ -214,7 +217,7 @@ def remove_static_clutter(range_fft):
         keepdims=True
     )
 
-    result = range_fft - clutter
+    result = range_fft - CLUTTERALPHA*clutter
 
     return result
 
