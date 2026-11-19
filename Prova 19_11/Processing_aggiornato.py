@@ -80,7 +80,7 @@ N_WINDOWS = 3
 
 IMAGE_SIZE = 24
 
-THRESHOLD = 0.10
+THRESHOLD = 0.05
 
 # "per_map" = normalizzazione indipendente di ogni mappa
 # "global"  = normalizzazione globale dell'intera registrazione
