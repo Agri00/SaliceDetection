@@ -1,0 +1,116 @@
+import os
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+import torchvision.transforms as transforms
+
+# ==========================================
+# 1. DEFINIZIONE DEL DATASET PER LA PREDIZIONE
+# ==========================================
+class PredictionDataset(Dataset):
+    def __init__(self, data_dir="./prediction_data", transform=None):
+        self.data_dir = data_dir
+        self.transform = transform
+        
+        # Filtra i file supportati (es. .gif, .png, .jpg) presenti nella cartella
+        valid_extensions = ('.gif', '.png', '.jpg', '.jpeg')
+        self.image_files = [f for f in os.listdir(data_dir) if f.lower().endswith(valid_extensions)]
+        
+        if len(self.image_files) == 0:
+            print(f"Attenzione: Nessun file compatibile trovato nella cartella '{data_dir}'.")
+
+    def __len__(self):
+        return len(self.image_files)
+
+    def __getitem__(self, idx):
+        img_name = self.image_files[idx]
+        img_path = os.path.join(self.data_dir, img_name)
+        
+        # Apre l'immagine e la converte in RGB
+        image = Image.open(img_path).convert('RGB')
+        
+        if self.transform:
+            image = self.transform(image)
+            
+        return image, img_name  # Restituisce anche il nome del file per tracciabilità
+
+
+# ==========================================
+# 2. DEFINIZIONE DELL'ARCHITETTURA DEL MODELLO
+# ==========================================
+# (Deve rispecchiare esattamente la stessa struttura usata durante l'addestramento)
+class MyCustomBNN(nn.Module):
+    def __init__(self):
+        super(MyCustomBNN, self).__init__()
+        # Esempio di struttura base (adatta in base alla tua rete effettiva)
+        self.flatten = nn.Flatten()
+        self.fc1 = nn.Linear(3 * 224 * 224, 128)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(128, 10) # 10 classi di output (esempio)
+        
+    def forward(self, x):
+        x = self.flatten(x)
+        x = self.fc1(x)
+        x = self.relu(x)
+        x = self.fc2(x)
+        return x
+
+
+# ==========================================
+# 3. SCRIPT PRINCIPALE DI INFERENZA
+# ==========================================
+def main():
+    # Imposta il dispositivo di calcolo (usa la GPU se disponibile, altrimenti CPU)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Esecuzione delle predizioni su dispositivo: {device}")
+
+    # Pipeline di preprocessing identica a quella usata in fase di training
+    transform_pipeline = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    # Inizializza Dataset e DataLoader per la cartella "prediction_data"
+    pred_dataset = PredictionDataset(data_dir="./prediction_data", transform=transform_pipeline)
+    
+    if len(pred_dataset) == 0:
+        return
+
+    pred_loader = DataLoader(pred_dataset, batch_size=16, shuffle=False)
+
+    # Istanzia il modello e carica i pesi salvati (.pth)
+    model = MyCustomBNN().to(device)
+    model_path = "./bnn_model_trained.pth"
+    
+    if not os.path.exists(model_path):
+        print(f"Errore: File dei pesi '{model_path}' non trovato. Assicurati di aver completato il training.")
+        return
+
+    # Caricamento dei pesi nello state_dict
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    
+    # CRITICO: Imposta il modello in modalità di valutazione
+    model.eval()
+    print("Modello caricato con successo ed pronto per l'inferenza.\n")
+
+    # Esecuzione delle predizioni senza calcolare i gradienti
+    with torch.no_grad():
+        for batch_images, batch_names in pred_loader:
+            batch_images = batch_images.to(device)
+            
+            # Forward pass
+            outputs = model(batch_images)
+            
+            # Ottiene la classe predetta (es. indice con valore massimo)
+            probabilities = torch.softmax(outputs, dim=1)
+            predicted_classes = torch.argmax(probabilities, dim=1)
+            
+            # Stampa i risultati per ogni file nel batch
+            for name, pred_class, probs in zip(batch_names, predicted_classes, probabilities):
+                confidence = probs[pred_class].item() * 100
+                print(f"File: {name} --> Classe Predetta: {pred_class.item()} (Confidenza: {confidence:.2f}%)")
+
+if __name__ == "__main__":
+    main()
