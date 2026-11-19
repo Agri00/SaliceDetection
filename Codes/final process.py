@@ -23,7 +23,7 @@ print("Shape originale:", power.shape)
 # 2. PARAMETRI
 # ==========================================
 
-threshold = 0.08
+threshold = 0.20
 target_size = (24, 24)
 
 X_gray = []
