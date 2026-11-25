@@ -230,10 +230,26 @@ def load_from_csv(
                 print(f"[SKIP] {npz_file.name}: durata utile < {WIN_STFT_STEPS} righe STFT.")
                 continue
 
+            #ciclo per mantenere nei file label=1 solo le finestre con almeno 2.5% di celle attive
+            windows_p, windows_b, windows_act = [], [], []
             for start in range(0, power.shape[0] - WIN_STFT_STEPS + 1, STRIDE_STFT_STEPS):
                 end = start + WIN_STFT_STEPS
-                all_power.append(power[start:end])
-                all_binary.append(binary[start:end])
+                win_b = binary[start:end]
+                windows_p.append(power[start:end])
+                windows_b.append(win_b)
+                windows_act.append(float(win_b.mean()))
+
+            if label == 1 and not start_s and not end_s:
+                # Scarta le finestre pre-caduta e post-caduta completamente ferme (< 2.5% celle attive)
+                valid_idx = [i for i, act in enumerate(windows_act) if act >= 0.025]
+                if not valid_idx:
+                    valid_idx = [int(np.argmax(windows_act))]
+            else:
+                valid_idx = list(range(len(windows_b)))
+
+            for i in valid_idx:
+                all_power.append(windows_p[i])
+                all_binary.append(windows_b[i])
                 all_thresh.append(thresh)
                 all_y.append(label)
                 all_groups.append(group_id)
@@ -249,33 +265,33 @@ def load_from_csv(
 
 def train_model(
     csv_path: str | Path,
-    epochs: int = 120,
+    base_dir: str | Path | None = None,
+    epochs: int = 200,
     batch_size: int = 32,
     output_weights: str = "bnn_fall_detection.pt",
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Controlla se nel CSV è stata compilata manualmente la colonna 'split'
-    tr_p, tr_b, tr_t, tr_y, _ = load_from_csv(csv_path, target_split="train")
-    va_p, va_b, va_t, va_y, _ = load_from_csv(csv_path, target_split="val")
+    csv_file = Path(csv_path)
+    if not csv_file.is_absolute():
+        csv_file = Path(__file__).resolve().parent / csv_file
+
+    tr_p, tr_b, tr_t, tr_y, _ = load_from_csv(csv_file, base_dir=base_dir, target_split="train")
+    va_p, va_b, va_t, va_y, _ = load_from_csv(csv_file, base_dir=base_dir, target_split="val")
+    te_p, te_b, te_t, te_y, _ = load_from_csv(csv_file, base_dir=base_dir, target_split="test")
 
     if len(tr_y) > 0 and len(va_y) > 0:
         train_ds = MicroDopplerBNNDataset(tr_p, tr_b, tr_t, tr_y, augment=True)
         val_ds = MicroDopplerBNNDataset(va_p, va_b, va_t, va_y, augment=False)
         y_train = tr_y
     else:
-        # Altrimenti carica tutto e divide automaticamente per subject_id
-        power_w, binary_w, thresh_w, y, groups = load_from_csv(csv_path)
-        gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-        train_idx, val_idx = next(gss.split(power_w, y, groups))
-
+        power_w, binary_w, thresh_w, y, groups = load_from_csv(csv_file, base_dir=base_dir)
+        train_idx, val_idx = group_train_val_split(groups, test_size=0.2, seed=42)
         train_ds = MicroDopplerBNNDataset(
-            power_w[train_idx], binary_w[train_idx], thresh_w[train_idx], y[train_idx],
-            augment=True,
+            power_w[train_idx], binary_w[train_idx], thresh_w[train_idx], y[train_idx], augment=True
         )
         val_ds = MicroDopplerBNNDataset(
-            power_w[val_idx], binary_w[val_idx], thresh_w[val_idx], y[val_idx],
-            augment=False,
+            power_w[val_idx], binary_w[val_idx], thresh_w[val_idx], y[val_idx], augment=False
         )
         y_train = y[train_idx]
 
@@ -285,10 +301,11 @@ def train_model(
     model = RadarFallBNN().to(device)
     num_pos = max(1, int(y_train.sum()))
     num_neg = max(1, len(y_train) - num_pos)
-    pos_weight = torch.tensor([num_neg / num_pos], device=device)
+    # Bilanciamento attenuato per evitare eccesso di falsi positivi
+    pos_weight = torch.tensor([(num_neg / num_pos) ** 0.5], device=device)
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = torch.optim.Adam(model.parameters(), lr=3e-3)
+    optimizer = torch.optim.Adam(model.parameters(), lr=5e-3)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
 
     best_f1 = -1.0
@@ -334,9 +351,36 @@ def train_model(
                 f"Val Recall: {recall:.3f} | Val Precision: {precision:.3f} | F1: {f1:.3f}"
             )
 
-    print(f"Modello salvato in {output_weights} (Miglior F1: {best_f1:.3f})")
+    print(f"\nModello salvato in {output_weights} (Miglior Val F1: {best_f1:.3f})")
+
+    # Valutazione finale sul Test Set con i pesi migliori salvati
+    if len(te_y) > 0:
+        model.load_state_dict(torch.load(output_weights, map_location=device, weights_only=True))
+        model.eval()
+        test_ds = MicroDopplerBNNDataset(te_p, te_b, te_t, te_y, augment=False)
+        test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+        all_probs, all_targets = [], []
+        with torch.no_grad():
+            for bx, by in test_loader:
+                probs = torch.sigmoid(model(bx.to(device))).cpu().numpy()
+                all_probs.append(probs)
+                all_targets.append(by.numpy())
+        probs_arr = np.concatenate(all_probs)
+        targets_arr = np.concatenate(all_targets)
+
+        print("\n--- RISULTATI SUL TEST SET ---")
+        for th in (0.45, 0.50, 0.55, 0.60):
+            preds = (probs_arr >= th).astype(float)
+            tp = int(((preds == 1) & (targets_arr == 1)).sum())
+            fp = int(((preds == 1) & (targets_arr == 0)).sum())
+            fn = int(((preds == 0) & (targets_arr == 1)).sum())
+            rec = tp / max(1, tp + fn)
+            prec = tp / max(1, tp + fp)
+            f1_t = 2 * prec * rec / max(1e-8, prec + rec)
+            print(f"Soglia {th:.2f} -> Test Recall: {rec:.3f} | Test Precision: {prec:.3f} | Test F1: {f1_t:.3f}")
+
     return model
 
 
 if __name__ == "__main__":
-    train_model("dataset_manifest.csv")
+    train_model(r"C:\Users\aless\Desktop\ProcessingTrainingInference\TUTTI_EVENTI\dataset_manifest.csv")
